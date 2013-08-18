@@ -33,6 +33,7 @@
 # include <linux/usb.h>
 # include <linux/spi/spi.h>
 # include <linux/gpio.h>
+# include <linux/timer.h>
 # include <linux/jiffies.h>
 #else
 # include <stdint.h>
@@ -57,6 +58,10 @@ extern int debug_level;
 extern int creek_enabled;
 extern int dump_urbs;
 extern int dump_commands;
+extern int poll_gpio;
+extern int poll_gpio_usecs;
+extern int poll_intr;
+extern int poll_intr_usecs;
 
 #else /* macros, typedefs & hacks for userspace compliation */
 # define BUG()			assert(0)
@@ -545,9 +550,11 @@ struct mcp2210_state {
 	int cur_spi_config;
 	u16 idle_cs;
 	u16 active_cs;
-	unsigned long spi_delay_per_xfer;
 	unsigned long spi_delay_per_kb;
-	unsigned long spi_delay_between_xfers;
+	unsigned long last_poll_gpio;
+	unsigned long last_poll_intr;
+	u16 gpio;
+	u16 interrupt_event_counter;
 };
 
 
@@ -732,6 +739,7 @@ struct mcp2210_device {
 	struct mcp2210_endpoint eps[2];
 
 	struct delayed_work delayed_work;
+	struct timer_list timer;
 
 	struct spi_device *chips[MCP2210_NUM_PINS];
 
@@ -741,6 +749,8 @@ struct mcp2210_device {
 	struct mcp2210_state s;
 	struct mcp2210_board_config *config;
 	struct mcp2210_cmd_ctl ctl_cmd;
+	struct mcp2210_cmd_ctl poll_gpio_cmd;
+	struct mcp2210_cmd_ctl poll_intr_cmd;
 #ifdef CONFIG_MCP2210_EEPROM
 	spinlock_t eeprom_spinlock;
 	u8 eeprom_state[64];

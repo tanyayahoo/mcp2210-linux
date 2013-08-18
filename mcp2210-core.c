@@ -180,13 +180,17 @@ static bool reschedule_delayed_work(struct mcp2210_device *dev,
 				    unsigned long _jiffies);
 static inline bool reschedule_delayed_work_ms(struct mcp2210_device *dev,
 					      unsigned int ms);
+static void delayed_work_callback(struct work_struct *work);
+static void timer_callback(unsigned long context);
+
 static void complete_urb(struct urb *urb);
-//static void complete_cmd(struct mcp2210_cmd *cmd);
 static int submit_urbs(struct mcp2210_cmd *cmd, gfp_t gfp_flags);
 
-static void delayed_work_callback(struct work_struct *work);
 static int unlink_urbs(struct mcp2210_device *dev);
 static void kill_urbs(struct mcp2210_device *dev, unsigned long *irqflags);
+
+static int add_cmd(struct mcp2210_cmd *cmd, int free_if_dead);
+static int complete_poll(struct mcp2210_cmd *cmd, void *context);
 
 static inline long jiffdiff(unsigned long a, unsigned long b)
 {
@@ -204,10 +208,19 @@ int debug_level	  = CONFIG_MCP2210_DEBUG_INITIAL;
 int creek_enabled = IS_ENABLED(CONFIG_MCP2210_CREEK);
 int dump_urbs	  = IS_ENABLED(CONFIG_MCP2210_DEBUG);
 int dump_commands = IS_ENABLED(CONFIG_MCP2210_DEBUG_VERBOSE);
-module_param(debug_level, int, 0664);
-module_param(creek_enabled, int, 0664);
-module_param(dump_urbs, int, 0664);
-module_param(dump_commands, int, 0664);
+int poll_gpio		= 0;
+int poll_gpio_usecs	= 100 * 1000; /* 10 times a second */
+int poll_intr		= 0;
+int poll_intr_usecs	= 100 * 1000;
+
+module_param(debug_level,	int, 0664);
+module_param(creek_enabled,	int, 0664);
+module_param(dump_urbs,		int, 0664);
+module_param(dump_commands,	int, 0664);
+module_param(poll_gpio,		int, 0664);
+module_param(poll_gpio_usecs,	int, 0664);
+module_param(poll_intr,		int, 0664);
+module_param(poll_intr_usecs,	int, 0664);
 
 /******************************************************************************
  * USB Driver structs
@@ -639,7 +652,6 @@ int mcp2210_probe(struct usb_interface *intf, const struct usb_device_id *id)
 	struct mcp2210_device *dev;
 	struct usb_host_endpoint *ep, *ep_end;
 	int ret = -ENODEV;
-//	int i;
 
 	printk("mcp2210_probe\n");
 
@@ -670,6 +682,14 @@ int mcp2210_probe(struct usb_interface *intf, const struct usb_device_id *id)
 #endif
 	mutex_init(&dev->io_mutex);
 	ctl_cmd_init(dev, &dev->ctl_cmd, 0, 0, NULL, 0, false);
+	ctl_cmd_init(dev, &dev->poll_gpio_cmd, MCP2210_CMD_GET_PIN_VALUE, 0, NULL, 0, false);
+	ctl_cmd_init(dev, &dev->poll_intr_cmd, MCP2210_CMD_GET_INTERRUPTS, 0, NULL, 0, false);
+	dev->poll_gpio_cmd.head.complete = complete_poll;
+	dev->poll_intr_cmd.head.complete = complete_poll;
+	INIT_DELAYED_WORK(&dev->delayed_work, delayed_work_callback);
+	init_timer(&dev->timer);
+	dev->timer.function = timer_callback;
+	dev->timer.data = (unsigned long)dev;
 #ifdef CONFIG_MCP2210_DEBUG
 	atomic_set(&dev->manager_running, 0);
 #endif
@@ -744,7 +764,6 @@ int mcp2210_probe(struct usb_interface *intf, const struct usb_device_id *id)
 	}
 
 	/* start up background cleanup thread */
-	INIT_DELAYED_WORK(&dev->delayed_work, delayed_work_callback);
 	schedule_delayed_work(&dev->delayed_work, msecs_to_jiffies(1000));
 
 	/* Submit the first command's URB */
@@ -1062,6 +1081,41 @@ defer:
 	goto exit_unlock;
 }
 
+static int complete_poll(struct mcp2210_cmd *cmd_head, void *context)
+{
+	struct mcp2210_device *dev = cmd_head->dev;
+	struct mcp2210_cmd_ctl *cmd = (void*)cmd_head;
+	int enabled;
+	unsigned long interval;
+	unsigned data;
+
+	if (cmd->req.cmd == MCP2210_CMD_GET_PIN_VALUE) {
+		enabled = poll_gpio;
+		interval = poll_gpio_usecs;
+		data = dev->eps[EP_IN].buffer->body.gpio;
+		dev->s.gpio = data;
+	} else {
+		enabled = poll_intr;
+		interval = poll_intr_usecs;
+		data = dev->eps[EP_IN].buffer->body.interrupt_event_counter;
+		dev->s.interrupt_event_counter = data;
+	}
+
+	if (!enabled)
+		return 0;
+
+	if (interval) {
+		cmd->head.delayed = 1;
+		cmd->head.delay_until = jiffies
+				      + usecs_to_jiffies(interval);
+	} else
+		cmd->head.delayed = 0;
+
+	add_cmd(cmd_head, false);
+
+	return -EINPROGRESS; /* tell process_commands not to free us */
+}
+
 
 /* We don't want this considered as a candidate for inlining, since it's
  * unlikely to be called and it would just bloat the text */
@@ -1222,6 +1276,87 @@ __cold noinline static void fail_command(struct mcp2210_device *dev, int error,
 	}
 }
 
+/*
+ * Returns:
+ * - 0 if there was nothing to do or there is a non-atomic command but
+ *   can_sleep was zero,
+ * - -1 if a command was executed, or
+ * - a positive number of jiffies if there is a delayed/deferred command that
+ *   needs to be executed, but is not yet due
+ */
+static unsigned long do_deferred_cmd(struct mcp2210_device *dev, int can_sleep)
+{
+	struct mcp2210_cmd *cmd;
+	unsigned long irqflags;
+	long ret = 0;
+
+	spin_lock_irqsave(&dev->dev_spinlock, irqflags);
+	cmd = dev->cur_cmd;
+
+	/* This function is called from two different contexts, a soft-interrupt
+	 * timer and a delayed_work. A race conditions should be impossible
+	 * here because
+	 * o If called from soft-irq, can_sleep is zero, so a non-atomic command
+	 *   is ignored
+	 * o If it's delayed work, we clear the delayed flag prior to releasing
+	 *   the lock.
+	 *
+	 * One other possibly alarming execution path can occur, but is safe
+	 * o the delayed_work calls for a non-atomic command
+	 * o dev_spinlock is released and process_commands is called
+	 * o the soft-irq runs
+	 *
+	 * This path is safe because dev->cur_cmd is never changed when
+	 * dev_spinlock is not held, nor is cmd->nonatomic ever cleared.  Thus,
+	 * the soft-irq call will always do nothing.
+	 */
+	if (cmd && (cmd->delayed || cmd->nonatomic)) {
+		if (!can_sleep && cmd->nonatomic) {
+			/* can't execute this job */
+			goto exit_unlock;
+		}
+
+		if (cmd->delayed) {
+			long diff = jiffdiff(cmd->delay_until, jiffies);
+
+			if (diff > 0) {
+				ret = diff;
+				goto exit_unlock;
+			}
+			cmd->delayed = 0;
+		}
+
+		if (cmd->nonatomic) {
+			mcp2210_debug("starting nonatomic execution...");
+			spin_unlock_irqrestore(&dev->dev_spinlock, irqflags);
+			process_commands(dev, GFP_KERNEL, 0);
+			spin_lock_irqsave(&dev->dev_spinlock, irqflags);
+		} else {
+			mcp2210_debug("starting delayed execution...");
+			process_commands(dev, GFP_ATOMIC, 1);
+		}
+
+		ret = -1;
+	}
+
+exit_unlock:
+	spin_unlock_irqrestore(&dev->dev_spinlock, irqflags);
+	return ret;
+}
+
+static void timer_callback(unsigned long context)
+{
+	struct mcp2210_device *dev = (void*)context;
+	long ret;
+
+	mcp2210_debug();
+
+	ret = do_deferred_cmd(dev, 0);
+	if (ret > 0) {
+		/* TODO: reschedule timer */
+	}
+}
+
 /* work queue callback to take care of hung URBs and other misc bottom half
  * stuff
  *
@@ -1237,10 +1372,11 @@ static void delayed_work_callback(struct work_struct *work)
 						  delayed_work);
 	struct mcp2210_cmd *cmd;
 	unsigned long irqflags;
-	long next_work = (long)msecs_to_jiffies(1000);
+	long next_work = (long)msecs_to_jiffies(4000);
 	struct mcp2210_endpoint *ep;
 	unsigned long start_time = jiffies;
 	int ret;
+	long lret;
 
 	/* static const */ long TIMEOUT_URB = msecs_to_jiffies(750) + 1;
 	/* static const */ long TIMEOUT_HUNG = msecs_to_jiffies(8000);
@@ -1250,7 +1386,7 @@ static void delayed_work_callback(struct work_struct *work)
 		atomic_dec(&dev->manager_running);
 		mcp2210_crit("BUG: two instances of delayed work running!******");
 
-		//BUG();
+		BUG();
 		return;
 	}
 #endif
@@ -1276,23 +1412,7 @@ static void delayed_work_callback(struct work_struct *work)
 			dev->debug_chatter_count = 0;
 	}
 
-	/* FIXME: configuration hack */
-#if 0
-	if (!dev->cur_cmd) {
-		if (dev->do_spi_probe) {
-			BUG_ON(dev->spi_master);
-			dev->do_spi_probe = 0;
-			spin_unlock_irqrestore(&dev->dev_spinlock, irqflags);
-			//fake_config(dev);
 
-			/* allow the device to suspend now */
-			usb_autopm_put_interface(dev->intf);
-			spin_lock_irqsave(&dev->dev_spinlock, irqflags);
-		}
-
-		goto exit_reschedule;
-	}
-#endif
 	if (!dev->cur_cmd)
 		goto exit_reschedule;
 
@@ -1300,33 +1420,15 @@ static void delayed_work_callback(struct work_struct *work)
 
 	mcp2210_debug("cmd: %p, cmd->state: %d", cmd, cmd->state);
 
-	if (cmd && (cmd->delayed || cmd->nonatomic)) do {
-		if (cmd->delayed) {
-			long diff = jiffdiff(cmd->delay_until, start_time);
+	/* run any deferred work that is now due */
+	spin_unlock_irqrestore(&dev->dev_spinlock, irqflags);
+	lret = do_deferred_cmd(dev, 1);
+	spin_lock_irqsave(&dev->dev_spinlock, irqflags);
 
-			if (diff > 0) {
-				next_work = diff;
-				break;
-			}
-			cmd->delayed = 0;
-		}
-
-		mcp2210_info("starting delayed/nonatomic execution...");
-		spin_unlock_irqrestore(&dev->dev_spinlock, irqflags);
-		process_commands(dev, GFP_KERNEL, 0);
-		spin_lock_irqsave(&dev->dev_spinlock, irqflags);
-
-		/* since we're potentially sleeping & rescheduling, let's
-		 * account for this when determining when to run next */
-		next_work -= jiffdiff(jiffies, start_time);
-		if (next_work < 0)
-			next_work = 0;
-
-		if (IS_ENABLED(CONFIG_MCP2210_DEBUG))
-			BUG_ON(next_work > (long)msecs_to_jiffies(1000));
-
+	if (lret == -1)
 		goto exit_reschedule;
-	} while(0);
+	else if (lret > 0)
+		next_work = lret;
 
 	/* check for stalled URBs */
 	for (ep = dev->eps; ep != &dev->eps[2]; ++ep) {
@@ -1419,7 +1521,7 @@ struct mcp2210_cmd *mcp2210_alloc_cmd(struct mcp2210_device *dev,
 }
 
 /* may have device or command locked, but not the queue */
-int mcp2210_add_or_free_cmd(struct mcp2210_cmd *cmd)
+static int add_cmd(struct mcp2210_cmd *cmd, int free_if_dead)
 {
 	struct mcp2210_device *dev = cmd->dev;
 	unsigned long irqflags;
@@ -1429,7 +1531,7 @@ int mcp2210_add_or_free_cmd(struct mcp2210_cmd *cmd)
 		return -ENOMEM;
 
 	spin_lock_irqsave(&dev->queue_spinlock, irqflags);
-	if (dev->dead) {
+	if (dev->dead && free_if_dead) {
 		kfree(cmd);
 		ret = -ESHUTDOWN;
 	} else
@@ -1438,6 +1540,11 @@ int mcp2210_add_or_free_cmd(struct mcp2210_cmd *cmd)
 
 	cmd->time_queued = jiffies;
 	return ret;
+}
+
+int mcp2210_add_or_free_cmd(struct mcp2210_cmd *cmd)
+{
+	return add_cmd(cmd, true);
 }
 
 /* Perform basic checks on a response received from the device. (Do command and

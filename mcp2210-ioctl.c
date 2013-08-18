@@ -312,14 +312,14 @@ complete_ioctl:
 
 static void reset_string_addr_single(const char **str, const char *min, const char *max, long diff)
 {
-//	const void *orig = *str;
+	const void *orig = *str;
 
 	if (*str < min || *str > max)
 		*str = NULL;
 	else
 		*str -= diff;
 
-	//printk(KERN_DEBUG "str: %p --> %p\n", orig, *str);
+	printk(KERN_DEBUG "str: %p --> %p\n", orig, *str);
 }
 
 static void reset_string_addr(struct mcp2210_board_config *bc, const __user struct mcp2210_board_config *user_ptr)
